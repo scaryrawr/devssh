@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -62,6 +63,7 @@ func run() error {
 	}
 	defer closeDebugLogger()
 	logDebug("devssh starting for host %q", host)
+	startupStart := time.Now()
 
 	if args.Verbose {
 		fmt.Fprintf(os.Stderr, "Logs: %s\n", getSessionLogDirectory())
@@ -69,7 +71,9 @@ func run() error {
 
 	// Start the ssh ControlMaster.
 	fmt.Fprintf(os.Stderr, "Connecting to %s...\n", host)
+	start := time.Now()
 	mux, err := StartMux(ctx, host, nil)
+	logElapsed("start ssh master", start)
 	if err != nil {
 		return fmt.Errorf("start ssh master: %w", err)
 	}
@@ -80,60 +84,75 @@ func run() error {
 	}()
 
 	// Preflight remote: warn (don't fail) on missing optional deps.
+	start = time.Now()
 	preflightRemote(ctx, mux)
+	logElapsed("remote preflight", start)
 
 	// Local services (best-effort; failures degrade gracefully).
 	var browserSvc *BrowserService
 	if !args.NoBrowser {
+		start = time.Now()
 		if svc, err := NewBrowserService(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to start browser service: %v\n", err)
 		} else {
 			browserSvc = svc
 			defer browserSvc.Stop()
 		}
+		logElapsed("start browser service", start)
 	}
 
 	var notifySvc *NotificationService
 	if !args.NoNotifications {
+		start = time.Now()
 		if svc, err := NewNotificationService(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to start notification service: %v\n", err)
 		} else {
 			notifySvc = svc
 			defer notifySvc.Stop()
 		}
+		logElapsed("start notification service", start)
 	}
 
 	// Stream-local remote forwards for the services. If either fails, disable
 	// that feature and continue.
 	if browserSvc != nil {
+		start = time.Now()
 		if err := mux.AddRemoteForward(browserSvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", browserSvc.Port)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to forward browser socket (browser opening disabled): %v\n", err)
 			browserSvc.Stop()
 			browserSvc = nil
 		}
+		logElapsed("forward browser socket", start)
 	}
 	if notifySvc != nil {
+		start = time.Now()
 		if err := mux.AddRemoteForward(notifySvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", notifySvc.Port)); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to forward notification socket (notifications disabled): %v\n", err)
 			notifySvc.Stop()
 			notifySvc = nil
 		}
+		logElapsed("forward notification socket", start)
 	}
 
 	// Reverse-forward local AI services (LM Studio, Ollama, ...).
+	start = time.Now()
 	boundForwards := GetBoundReverseForwards()
+	logElapsed("probe reverse forward ports", start)
 	if len(boundForwards) > 0 {
 		LogReverseForwards(boundForwards)
 		for _, fw := range boundForwards {
 			spec := fmt.Sprintf("%d", fw.Port)
 			local := fmt.Sprintf("127.0.0.1:%d", fw.Port)
+			start = time.Now()
 			if err := mux.AddRemoteForward(spec, local); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to forward port %d: %v\n", fw.Port, err)
 			}
+			logElapsed(fmt.Sprintf("forward reverse port %d", fw.Port), start)
 		}
 	}
 
 	// Upload helper scripts to the remote in a single shell command.
+	start = time.Now()
 	if err := prepareRemoteScripts(ctx, mux, prepareOpts{
 		hasBrowser:      browserSvc != nil,
 		hasNotification: notifySvc != nil,
@@ -142,6 +161,7 @@ func run() error {
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to upload helper scripts: %v\n", err)
 	}
+	logElapsed("prepare remote scripts", start)
 
 	if notifySvc != nil {
 		fmt.Fprintf(os.Stderr, "Command completion notifications available! To enable, add to your shell config:\n")
@@ -157,12 +177,14 @@ func run() error {
 	// Start the remote port monitor.
 	var monitor *PortMonitorController
 	if !args.NoPortMonitor {
+		start = time.Now()
 		m, err := StartPortMonitor(ctx, mux)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to start port monitor: %v\n", err)
 		} else {
 			monitor = m
 		}
+		logElapsed("start port monitor", start)
 	}
 	if monitor != nil {
 		defer func() {
@@ -170,6 +192,8 @@ func run() error {
 			monitor.Wait()
 		}()
 	}
+
+	logElapsed("startup before interactive shell", startupStart)
 
 	// Hand control to the interactive shell.
 	return mux.InteractiveShell(ctx, args.RemainingArgs)

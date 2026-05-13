@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Mux owns an OpenSSH ControlMaster connection for the duration of a devssh
@@ -60,7 +61,9 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 	}
 
 	// Stale socket from a previous run will block bind; try to evict.
-	_ = os.Remove(socket)
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		logDebug("remove stale mux socket %s: %v", socket, err)
+	}
 
 	args := []string{
 		"-M",
@@ -79,16 +82,24 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	start := time.Now()
 	if err := cmd.Run(); err != nil {
+		logElapsed("ssh ControlMaster command", start)
 		return nil, fmt.Errorf("start ssh ControlMaster for %s: %w (stderr: %s)", host, err, strings.TrimSpace(stderr.String()))
 	}
+	logElapsed("ssh ControlMaster command", start)
 
 	m := &Mux{Host: host, SocketPath: socket}
 
+	start = time.Now()
 	if err := m.Check(); err != nil {
-		_ = m.Stop()
+		logElapsed("ssh ControlMaster check", start)
+		if stopErr := m.Stop(); stopErr != nil {
+			logDebug("stop failed after ControlMaster check error: %v", stopErr)
+		}
 		return nil, fmt.Errorf("ControlMaster did not become ready: %w", err)
 	}
+	logElapsed("ssh ControlMaster check", start)
 
 	return m, nil
 }
@@ -227,7 +238,9 @@ func (m *Mux) Stop() error {
 			// interactive session exited. Surface as a soft error.
 			m.stopErr = fmt.Errorf("ssh -O exit: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 		}
-		_ = os.Remove(m.SocketPath)
+		if err := os.Remove(m.SocketPath); err != nil && !os.IsNotExist(err) {
+			logDebug("remove mux socket %s: %v", m.SocketPath, err)
+		}
 	})
 	return m.stopErr
 }
