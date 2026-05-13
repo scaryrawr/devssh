@@ -1,16 +1,66 @@
 #!/usr/bin/env bash
 # xdg-open shim for GitHub Codespaces (SSH environment)
 #
-# Replaces the real xdg-open and intelligently routes open requests:
+# Replaces the real xdg-open and intelligently routes SSH open requests:
 #   - URLs  → forwarded via devssh browser socket, $BROWSER, VS Code, or silent no-op
 #   - Files → opened with an appropriate viewer (chafa, pdftotext, glow, bat, $EDITOR…)
-#             in a tmux pane (if available), via VS Code, or inline over SSH.
+#             in a tmux pane (if available) or inline over SSH.
+# Outside SSH, immediately delegates to the real xdg-open.
 #
-# Anti-recursion: this script never calls "xdg-open" from PATH.
-# When delegating to the real binary it uses a hardcoded path (/usr/bin/xdg-open
-# or /bin/xdg-open) to avoid calling ourselves.
+# Anti-recursion: this script never calls the first "xdg-open" from PATH.
+# When delegating to the real binary, it searches for an executable named
+# xdg-open that is not this shim (including symlinks), with /usr/bin and /bin
+# as final fallbacks.
 
 set -euo pipefail
+
+# has_ssh_connection: returns 0 when running under an SSH session.
+has_ssh_connection() {
+    [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" ]]
+}
+
+# find_real_xdg_open: print the first xdg-open executable that is not this shim.
+find_real_xdg_open() {
+    local self="${BASH_SOURCE[0]}"
+    if [[ "$self" != */* ]]; then
+        self="$(type -P "$self" 2>/dev/null || printf '%s' "$self")"
+    fi
+
+    local candidate
+    while IFS= read -r candidate; do
+        [[ -z "$candidate" || ! -x "$candidate" ]] && continue
+        if [[ -e "$self" && "$candidate" -ef "$self" ]]; then
+            continue
+        fi
+        printf '%s\n' "$candidate"
+        return 0
+    done < <(
+        type -P -a xdg-open 2>/dev/null || true
+        printf '%s\n' /usr/bin/xdg-open /bin/xdg-open
+    )
+
+    return 1
+}
+
+# real_xdg_open: call the system xdg-open without recursing into this shim.
+real_xdg_open() {
+    local real
+    real="$(find_real_xdg_open)" || return 1
+    "$real" "$@"
+}
+
+# exec_real_xdg_open: replace this shim with the system xdg-open.
+exec_real_xdg_open() {
+    local real
+    real="$(find_real_xdg_open)" || return 1
+    exec "$real" "$@"
+}
+
+# Outside SSH, behave exactly like the system xdg-open instead of applying any
+# devssh-specific URL/file handling.
+if ! has_ssh_connection; then
+    exec_real_xdg_open "$@" || exit $?
+fi
 
 TARGET="${1:-}"
 
@@ -56,13 +106,8 @@ open_url() {
         code --open-url "$url" &>/dev/null && return 0
     fi
 
-    # 4. Try the real xdg-open (hardcoded paths to avoid calling ourselves;
-    #    /usr/bin is standard on Ubuntu-based codespaces, /bin is a fallback).
-    if [[ -x /usr/bin/xdg-open ]]; then
-        /usr/bin/xdg-open "$url" &>/dev/null && return 0
-    elif [[ -x /bin/xdg-open ]]; then
-        /bin/xdg-open "$url" &>/dev/null && return 0
-    fi
+    # 4. Try the real xdg-open.
+    real_xdg_open "$url" &>/dev/null && return 0
 
     # 5. Silent no-op — headless environment, nothing else we can do.
     return 0
@@ -127,19 +172,6 @@ is_interactive_editor() {
     return 1
 }
 
-# real_xdg_open: call the system xdg-open using a hardcoded path so we never
-# recurse into ourselves. /usr/bin is standard on Ubuntu-based codespaces;
-# /bin is an additional fallback for other distributions.
-real_xdg_open() {
-    if [[ -x /usr/bin/xdg-open ]]; then
-        /usr/bin/xdg-open "$@"
-    elif [[ -x /bin/xdg-open ]]; then
-        /bin/xdg-open "$@"
-    else
-        return 1
-    fi
-}
-
 # open_file: open a file using the best available strategy.
 open_file() {
     local file="$1"
@@ -167,18 +199,6 @@ open_file() {
             printf -v quoted_cmd '%q ' "${VIEWER_CMD[@]}"
             tmux split-window -h "bash -c ${quoted_cmd@Q}; read -r -p 'Press enter to close...'"
         fi
-
-    elif [[ -z "${SSH_TTY:-}" && -z "${SSH_CONNECTION:-}" ]]; then
-        # Not in an SSH session — try graphical/desktop openers first.
-        real_xdg_open "$file" &>/dev/null && return 0
-
-        # Try VS Code.
-        if command -v code &>/dev/null; then
-            code "$file" &>/dev/null && return 0
-        fi
-
-        # Fall through to inline viewer.
-        "${VIEWER_CMD[@]}"
 
     else
         # SSH session without tmux → run viewer inline (blocking).
