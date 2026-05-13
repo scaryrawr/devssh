@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -46,18 +47,21 @@ func (m selectionModel) View() string {
 	if title == "" {
 		title = "Choose a host:"
 	}
-	s := title + "\n\n"
+
+	var b strings.Builder
+	b.Grow(len(title) + len(m.choices)*32 + 32)
+	fmt.Fprintf(&b, "%s\n\n", title)
 
 	for i, choice := range m.choices {
 		cursor := " "
 		if m.cursor == i {
 			cursor = ">"
 		}
-		s += fmt.Sprintf("%s %s\n", cursor, choice)
+		fmt.Fprintf(&b, "%s %s\n", cursor, choice)
 	}
 
-	s += "\nPress q to quit.\n"
-	return s
+	b.WriteString("\nPress q to quit.\n")
+	return b.String()
 }
 
 // showSelection presents a list of options and returns the index of the

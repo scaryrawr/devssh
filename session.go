@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -206,11 +207,9 @@ func ListRecentLogFiles() {
 	}
 
 	// Sort newest first.
-	for i := 1; i < len(sessions); i++ {
-		for j := i; j > 0 && sessions[j-1].modTime.Before(sessions[j].modTime); j-- {
-			sessions[j-1], sessions[j] = sessions[j], sessions[j-1]
-		}
-	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].modTime.After(sessions[j].modTime)
+	})
 
 	fmt.Printf("Recent log sessions in %s:\n\n", logDir)
 
