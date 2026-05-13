@@ -79,8 +79,8 @@ devssh my-dev-box -- htop
 | Flag | Description |
 |---|---|
 | `--logs` | List recent log sessions and exit |
-| `--install-xdg-open` | Symlink `~/xdg-open.sh` into `/usr/local/bin` on the remote (needs passwordless `sudo`) |
-| `--no-xdg-open` | Skip uploading the `xdg-open` shim |
+| `--install-xdg-open` | Also symlink `~/xdg-open.sh` into `/usr/local/bin` on the remote (needs passwordless `sudo`) |
+| `--no-xdg-open` | Skip uploading and installing the `xdg-open` shim |
 | `--no-port-monitor` | Disable the remote port monitor |
 | `--no-browser` | Disable the local browser-opener service |
 | `--no-notifications` | Disable the local notification service |
@@ -118,7 +118,10 @@ on macOS, `%AppData%` on Windows.) Override the path with the
 - `reversePortForward` entries are merged in this order: built-in defaults
   → top-level config → per-host overrides. Later entries override earlier
   ones by port number.
-- `installXdgOpen` defaults to `false`. Per-host overrides take precedence.
+- devssh installs the `xdg-open` shim into `~/.local/bin/xdg-open` by
+  default. Ensure `~/.local/bin` is on the remote `PATH`.
+- `installXdgOpen` defaults to `false`; when enabled, devssh also installs
+  the shim into `/usr/local/bin/xdg-open`. Per-host overrides take precedence.
 
 ## How It Works
 

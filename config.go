@@ -82,8 +82,9 @@ func (c AppConfig) ReversePortForwardsForHost(host string) []ReversePortForward 
 	return MergeReversePortForwards(WellKnownPorts, c.ReversePortForward, hostForwards)
 }
 
-// InstallXdgOpenForHost reports whether the xdg-open shim should be
-// symlinked into /usr/local/bin on the remote. Per-host overrides take
+// InstallXdgOpenForHost reports whether the xdg-open shim should also be
+// symlinked into /usr/local/bin on the remote. The user-local
+// ~/.local/bin/xdg-open shim is installed by default. Per-host overrides take
 // precedence over the global setting; both default to false.
 func (c AppConfig) InstallXdgOpenForHost(host string) bool {
 	if hc, ok := c.Hosts[host]; ok && hc.InstallXdgOpen != nil {

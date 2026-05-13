@@ -45,8 +45,8 @@ Flags:
 	}
 
 	logsFlag := fs.Bool("logs", false, "List recent log files and exit")
-	installXdg := fs.Bool("install-xdg-open", false, "Symlink the xdg-open shim into /usr/local/bin on the remote (requires sudo)")
-	noXdg := fs.Bool("no-xdg-open", false, "Skip uploading the xdg-open shim entirely")
+	installXdg := fs.Bool("install-xdg-open", false, "Also symlink the xdg-open shim into /usr/local/bin on the remote (requires sudo)")
+	noXdg := fs.Bool("no-xdg-open", false, "Skip uploading and installing the xdg-open shim")
 	noPort := fs.Bool("no-port-monitor", false, "Do not start the remote port monitor")
 	noBrowser := fs.Bool("no-browser", false, "Do not start the local browser opener service")
 	noNotify := fs.Bool("no-notifications", false, "Do not start the local notification service")

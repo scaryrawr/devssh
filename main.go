@@ -223,6 +223,48 @@ type prepareOpts struct {
 	uploadXdgOpen   bool
 }
 
+const (
+	xdgOpenNotOnPathMarker      = "DEVSSH_XDG_OPEN_NOT_ON_PATH:"
+	xdgOpenUserLinkExistsMarker = "DEVSSH_XDG_OPEN_USER_LINK_EXISTS:"
+)
+
+func buildXdgOpenUserInstallCommand() string {
+	return fmt.Sprintf(`(mkdir -p "$HOME/.local/bin" && if [ ! -e "$HOME/.local/bin/xdg-open" ] || [ -L "$HOME/.local/bin/xdg-open" ]; then ln -sfn "$HOME/xdg-open.sh" "$HOME/.local/bin/xdg-open"; else printf '%%s\n' "%s$HOME/.local/bin/xdg-open"; fi)`, xdgOpenUserLinkExistsMarker)
+}
+
+func buildXdgOpenPathCheckCommand() string {
+	return fmt.Sprintf(`(resolved="$(command -v xdg-open 2>/dev/null || true)"; if [ -z "$resolved" ] || ! { [ "$HOME/xdg-open.sh" -ef "$resolved" ] 2>/dev/null; }; then printf '%%s\n' "%s${resolved:-<missing>}"; fi)`, xdgOpenNotOnPathMarker)
+}
+
+func parseXdgOpenSetupStdout(stdout string) (userLinkConflict, resolvedPath string) {
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, xdgOpenUserLinkExistsMarker) {
+			userLinkConflict = strings.TrimPrefix(line, xdgOpenUserLinkExistsMarker)
+		}
+		if strings.HasPrefix(line, xdgOpenNotOnPathMarker) {
+			resolvedPath = strings.TrimPrefix(line, xdgOpenNotOnPathMarker)
+		}
+	}
+	return userLinkConflict, resolvedPath
+}
+
+func buildXdgOpenInstallCommand(binDir string) string {
+	cleanBinDir := strings.TrimRight(binDir, "/")
+	if cleanBinDir == "" {
+		cleanBinDir = "/"
+	}
+
+	linkPath := cleanBinDir + "/xdg-open"
+	if cleanBinDir == "/" {
+		linkPath = "/xdg-open"
+	}
+
+	quotedBinDir := quoteForShell(cleanBinDir)
+	quotedLinkPath := quoteForShell(linkPath)
+	return fmt.Sprintf(`(if [ -d %[1]s ] && [ -w %[1]s ]; then ln -sfn "$HOME/xdg-open.sh" %[2]s; else sudo -n mkdir -p %[1]s && sudo -n ln -sfn "$HOME/xdg-open.sh" %[2]s; fi) && test -L %[2]s && [ "$HOME/xdg-open.sh" -ef %[2]s ]`, quotedBinDir, quotedLinkPath)
+}
+
 // prepareRemoteScripts writes all helper scripts to the remote in a single
 // SSH call using base64-encoded payloads.
 func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error {
@@ -258,9 +300,15 @@ func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error
 	}
 	cmdParts = append(cmdParts, "chmod +x "+chmodFiles)
 
+	if opts.uploadXdgOpen {
+		cmdParts = append(cmdParts, buildXdgOpenUserInstallCommand())
+	}
+
 	if opts.installXdgOpen && opts.uploadXdgOpen {
-		cmdParts = append(cmdParts,
-			"(test -L /usr/local/bin/xdg-open || sudo ln -sf ~/xdg-open.sh /usr/local/bin/xdg-open)")
+		cmdParts = append(cmdParts, buildXdgOpenInstallCommand("/usr/local/bin"))
+	}
+	if opts.uploadXdgOpen {
+		cmdParts = append(cmdParts, buildXdgOpenPathCheckCommand())
 	}
 
 	// Clean up stale sockets from prior sessions.
@@ -273,15 +321,27 @@ func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error
 	wrapped := wrapBashLoginCommand(fullCmd)
 	stdout, stderr, err := mux.Run(ctx, wrapped...)
 	if err != nil {
-		return fmt.Errorf("upload scripts: %w (stdout: %s, stderr: %s)", err,
+		return fmt.Errorf("prepare remote scripts: %w (stdout: %s, stderr: %s)", err,
 			strings.TrimSpace(stdout), strings.TrimSpace(stderr))
 	}
 
+	xdgOpenUserLinkConflict, xdgOpenResolvedPath := parseXdgOpenSetupStdout(stdout)
+
 	fmt.Fprintln(os.Stderr, "Helper scripts uploaded.")
+	if opts.uploadXdgOpen {
+		if xdgOpenUserLinkConflict == "" {
+			fmt.Fprintln(os.Stderr, "xdg-open shim installed at ~/.local/bin/xdg-open")
+		} else {
+			fmt.Fprintln(os.Stderr, "xdg-open shim uploaded to ~/xdg-open.sh")
+			fmt.Fprintf(os.Stderr, "Warning: %s already exists and is not a symlink; leaving it unchanged.\n", xdgOpenUserLinkConflict)
+		}
+		if xdgOpenResolvedPath != "" {
+			fmt.Fprintf(os.Stderr, "Warning: xdg-open does not currently resolve to the devssh shim (resolved: %s).\n", xdgOpenResolvedPath)
+			fmt.Fprintln(os.Stderr, `Add this to your remote shell config: export PATH="$HOME/.local/bin:$PATH"`)
+		}
+	}
 	if opts.installXdgOpen && opts.uploadXdgOpen {
-		fmt.Fprintln(os.Stderr, "xdg-open shim installed at /usr/local/bin/xdg-open")
-	} else if opts.uploadXdgOpen {
-		fmt.Fprintln(os.Stderr, "xdg-open shim available at ~/xdg-open.sh (use --install-xdg-open to symlink into /usr/local/bin)")
+		fmt.Fprintln(os.Stderr, "xdg-open shim also installed at /usr/local/bin/xdg-open")
 	}
 	if opts.hasBrowser {
 		fmt.Fprintf(os.Stderr, "\nBrowser opener available! To enable browser forwarding, add to your shell config:\n")

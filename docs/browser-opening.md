@@ -29,9 +29,19 @@ machine so links you click in remote tools open in your browser.
 
 devssh also uploads `~/xdg-open.sh`, a smarter wrapper that routes URLs
 through the same browser socket and opens local files with an appropriate
-viewer (chafa for images, glow for markdown, etc.). Pass
-`--install-xdg-open` to symlink it as `/usr/local/bin/xdg-open` on the
-remote (needs passwordless sudo). Otherwise just alias it in your shell.
+viewer (chafa for images, glow for markdown, etc.). By default, devssh
+symlinks it as `~/.local/bin/xdg-open` on the remote.
+
+Most Linux shell profiles put `~/.local/bin` on `PATH` once the directory
+exists. If `xdg-open` still resolves to the system binary, add this to your
+remote shell config:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Pass `--install-xdg-open` to also symlink it as
+`/usr/local/bin/xdg-open` on the remote (needs passwordless sudo).
 
 ## Use cases
 
