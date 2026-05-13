@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"sync"
+	"time"
 )
 
 // ReversePortForward represents a reverse port forward configuration.
@@ -50,27 +54,60 @@ func MergeReversePortForwards(lists ...[]ReversePortForward) []ReversePortForwar
 	return merged
 }
 
+const portProbeTimeout = 150 * time.Millisecond
+
 // isPortBound checks if a port is bound on the local machine.
 func isPortBound(port int) bool {
-	conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+	return isPortBoundWithTimeout(port, portProbeTimeout)
+}
+
+func isPortBoundWithTimeout(port int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort("localhost", strconv.Itoa(port)))
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		logDebug("close port probe connection for %d: %v", port, err)
+	}
 	return true
 }
 
 // GetBoundReverseForwards returns the subset of WellKnownPorts that should be
 // reverse-forwarded based on local availability or the AlwaysForward flag.
 func GetBoundReverseForwards() []ReversePortForward {
-	var boundPorts []ReversePortForward
+	forwards := append([]ReversePortForward(nil), WellKnownPorts...)
+	bound := make([]bool, len(forwards))
 
-	for _, forward := range WellKnownPorts {
+	const maxConcurrentProbes = 16
+	sem := make(chan struct{}, maxConcurrentProbes)
+	var wg sync.WaitGroup
+
+	for i, forward := range forwards {
 		if !forward.Enabled {
 			continue
 		}
+		if forward.AlwaysForward {
+			bound[i] = true
+			continue
+		}
 
-		if forward.AlwaysForward || isPortBound(forward.Port) {
+		wg.Add(1)
+		go func(i int, port int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			bound[i] = isPortBound(port)
+		}(i, forward.Port)
+	}
+	wg.Wait()
+
+	boundPorts := make([]ReversePortForward, 0, len(forwards))
+	for i, forward := range forwards {
+		if bound[i] {
 			boundPorts = append(boundPorts, forward)
 		}
 	}
@@ -103,4 +140,14 @@ func IsReverseForwardedPort(port int) bool {
 		}
 	}
 	return false
+}
+
+func reverseForwardedPortSet() map[int]struct{} {
+	ports := make(map[int]struct{}, len(WellKnownPorts))
+	for _, forward := range WellKnownPorts {
+		if forward.Enabled {
+			ports[forward.Port] = struct{}{}
+		}
+	}
+	return ports
 }

@@ -94,6 +94,13 @@ func (a *activeForwards) add(port int) {
 	a.ports[port] = struct{}{}
 }
 
+func (a *activeForwards) contains(port int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.ports[port]
+	return ok
+}
+
 func (a *activeForwards) remove(port int) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -140,6 +147,7 @@ func runPortMonitor(ctx context.Context, mux *Mux) error {
 	}()
 
 	forwards := newActiveForwards()
+	reverseForwardedPorts := reverseForwardedPortSet()
 	defer cleanupForwards(mux, forwards)
 
 	done := make(chan struct{})
@@ -168,7 +176,7 @@ func runPortMonitor(ctx context.Context, mux *Mux) error {
 				if err := json.Unmarshal([]byte(line), &pm); err != nil {
 					continue
 				}
-				handlePortMessage(mux, pm, forwards)
+				handlePortMessage(mux, pm, forwards, reverseForwardedPorts)
 			case "log":
 				var lm LogMessage
 				if err := json.Unmarshal([]byte(line), &lm); err != nil {
@@ -195,11 +203,15 @@ func runPortMonitor(ctx context.Context, mux *Mux) error {
 	}
 }
 
-func handlePortMessage(mux *Mux, msg PortMessage, forwards *activeForwards) {
+func handlePortMessage(mux *Mux, msg PortMessage, forwards *activeForwards, reverseForwardedPorts map[int]struct{}) {
 	switch msg.Action {
 	case "bound":
-		if IsReverseForwardedPort(msg.Port) {
+		if _, ok := reverseForwardedPorts[msg.Port]; ok {
 			logDebug("Port %d is reverse-forwarded, skipping local forward", msg.Port)
+			return
+		}
+		if forwards.contains(msg.Port) {
+			logDebug("Port %d is already forwarded, skipping duplicate bound event", msg.Port)
 			return
 		}
 		if err := mux.AddLocalForward(msg.Port, msg.Port); err != nil {
