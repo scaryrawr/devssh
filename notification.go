@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -64,7 +65,11 @@ func NewNotificationService(ctx context.Context) (*NotificationService, error) {
 	mux.HandleFunc("/notify", service.handleNotification)
 
 	service.server = &http.Server{
-		Handler: mux,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	service.wg.Add(1)
@@ -75,7 +80,11 @@ func NewNotificationService(ctx context.Context) (*NotificationService, error) {
 
 func (ns *NotificationService) serve() {
 	defer ns.wg.Done()
-	defer ns.listener.Close()
+	defer func() {
+		if err := ns.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logDebug("Notification listener close: %v", err)
+		}
+	}()
 
 	logDebug("Notification HTTP service starting on port %d", ns.Port)
 
@@ -125,7 +134,9 @@ func (ns *NotificationService) handleNotification(w http.ResponseWriter, r *http
 
 	logDebug("Successfully sent notification")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		logDebug("write notification response: %v", err)
+	}
 }
 
 func truncateWithEllipsis(s string, max int) string {
@@ -150,7 +161,9 @@ func (ns *NotificationService) Stop() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 
-		ns.server.Shutdown(shutdownCtx)
+		if err := ns.server.Shutdown(shutdownCtx); err != nil {
+			logDebug("NotificationService shutdown: %v", err)
+		}
 		ns.cancel()
 		ns.wg.Wait()
 

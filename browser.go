@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -58,7 +59,11 @@ func NewBrowserService(ctx context.Context) (*BrowserService, error) {
 	mux.HandleFunc("/open", service.handleOpenURL)
 
 	service.server = &http.Server{
-		Handler: mux,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	service.wg.Add(1)
@@ -69,7 +74,11 @@ func NewBrowserService(ctx context.Context) (*BrowserService, error) {
 
 func (bs *BrowserService) serve() {
 	defer bs.wg.Done()
-	defer bs.listener.Close()
+	defer func() {
+		if err := bs.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logDebug("Browser listener close: %v", err)
+		}
+	}()
 
 	logDebug("Browser HTTP service starting on port %d", bs.Port)
 
@@ -105,7 +114,9 @@ func (bs *BrowserService) handleOpenURL(w http.ResponseWriter, r *http.Request) 
 	logDebug("Successfully opened URL in browser")
 	fmt.Fprintf(os.Stderr, "Opened in browser: %s\n", url)
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		logDebug("write browser response: %v", err)
+	}
 }
 
 // Stop terminates the HTTP server and cleans up any stale socket file.
@@ -116,7 +127,9 @@ func (bs *BrowserService) Stop() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 
-		bs.server.Shutdown(shutdownCtx)
+		if err := bs.server.Shutdown(shutdownCtx); err != nil {
+			logDebug("BrowserService shutdown: %v", err)
+		}
 		bs.cancel()
 		bs.wg.Wait()
 
