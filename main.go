@@ -141,13 +141,13 @@ func run() error {
 	if len(boundForwards) > 0 {
 		LogReverseForwards(boundForwards)
 		for _, fw := range boundForwards {
-			spec := fmt.Sprintf("%d", fw.Port)
-			local := fmt.Sprintf("127.0.0.1:%d", fw.Port)
+			remote := fw.RemoteSpec()
+			local := fw.LocalSpec()
 			start = time.Now()
-			if err := mux.AddRemoteForward(spec, local); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to forward port %d: %v\n", fw.Port, err)
+			if err := mux.AddRemoteForward(remote, local); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to forward %s to %s: %v\n", fw.localLabel(), fw.remoteLabel(), err)
 			}
-			logElapsed(fmt.Sprintf("forward reverse port %d", fw.Port), start)
+			logElapsed(fmt.Sprintf("forward reverse %s to %s", fw.localLabel(), fw.remoteLabel()), start)
 		}
 	}
 

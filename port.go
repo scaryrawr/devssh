@@ -6,16 +6,23 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ReversePortForward represents a reverse port forward configuration.
 type ReversePortForward struct {
-	Port          int    `json:"port"`
-	Description   string `json:"description"`
+	Port          int    `json:"port,omitempty"`       // Legacy shorthand for localPort and remotePort.
+	LocalPort     int    `json:"localPort,omitempty"`  // Local TCP port to expose to the remote.
+	RemotePort    int    `json:"remotePort,omitempty"` // Remote TCP port to listen on.
+	LocalSocket   string `json:"localSocket,omitempty"`
+	RemoteSocket  string `json:"remoteSocket,omitempty"`
+	Description   string `json:"description,omitempty"`
 	Enabled       bool   `json:"enabled"`
-	AlwaysForward bool   `json:"alwaysForward"` // If true, forward even when port is not bound locally
+	AlwaysForward bool   `json:"alwaysForward"` // If true, forward even when the local endpoint is not bound
 }
 
 // WellKnownPorts defines commonly used local service ports that should be
@@ -26,32 +33,157 @@ var WellKnownPorts = []ReversePortForward{
 	{Port: 11434, Description: "Ollama", Enabled: true},
 }
 
-// MergeReversePortForwards merges default and override port lists by port number.
-// Later lists override earlier entries for the same port. Entries with invalid
-// port numbers (≤0 or >65535) are skipped with a warning.
+const reverseForwardGUIDPlaceholder = "$GUID"
+
+// MergeReversePortForwards merges default and override port lists by local
+// endpoint. Later lists override earlier entries for the same local endpoint.
+// Invalid entries are skipped with a warning.
 func MergeReversePortForwards(lists ...[]ReversePortForward) []ReversePortForward {
-	mergedByPort := make(map[int]ReversePortForward)
-	var order []int
+	mergedByKey := make(map[string]ReversePortForward)
+	var order []string
 
 	for _, forwards := range lists {
 		for _, forward := range forwards {
-			if forward.Port <= 0 || forward.Port > 65535 {
-				fmt.Fprintf(os.Stderr, "Warning: skipping reverse port forward with invalid port %d (%q)\n", forward.Port, forward.Description)
+			if err := validateReversePortForward(forward); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: skipping reverse port forward %q: %v\n", forward.Description, err)
 				continue
 			}
-			if _, exists := mergedByPort[forward.Port]; !exists {
-				order = append(order, forward.Port)
+			key := forward.mergeKey()
+			if _, exists := mergedByKey[key]; !exists {
+				order = append(order, key)
 			}
-			mergedByPort[forward.Port] = forward
+			mergedByKey[key] = normalizeReversePortForward(forward)
 		}
 	}
 
 	merged := make([]ReversePortForward, 0, len(order))
-	for _, port := range order {
-		merged = append(merged, mergedByPort[port])
+	for _, key := range order {
+		merged = append(merged, mergedByKey[key])
 	}
 
 	return merged
+}
+
+func normalizeReversePortForward(forward ReversePortForward) ReversePortForward {
+	forward.LocalSocket = strings.TrimSpace(forward.LocalSocket)
+	forward.RemoteSocket = strings.TrimSpace(forward.RemoteSocket)
+	return forward
+}
+
+func validateReversePortForward(forward ReversePortForward) error {
+	forward = normalizeReversePortForward(forward)
+
+	if forward.Port != 0 && forward.LocalPort != 0 && forward.Port != forward.LocalPort {
+		return fmt.Errorf("port and localPort cannot both be set to different values")
+	}
+
+	localPort := forward.effectiveLocalPort()
+	hasLocalPort := localPort != 0
+	hasLocalSocket := forward.LocalSocket != ""
+	if hasLocalPort == hasLocalSocket {
+		return fmt.Errorf("set exactly one local endpoint: port/localPort or localSocket")
+	}
+	if hasLocalPort && !isValidTCPPort(localPort) {
+		return fmt.Errorf("invalid local port %d", localPort)
+	}
+	if hasLocalSocket {
+		if !strings.HasPrefix(forward.LocalSocket, "/") {
+			return fmt.Errorf("localSocket must be an absolute Unix socket path")
+		}
+		if strings.Contains(forward.LocalSocket, ":") {
+			return fmt.Errorf("localSocket cannot contain ':'")
+		}
+	}
+
+	remotePort := forward.effectiveRemotePort()
+	hasRemotePort := remotePort != 0
+	hasRemoteSocket := forward.RemoteSocket != ""
+	if hasRemotePort == hasRemoteSocket {
+		return fmt.Errorf("set exactly one remote endpoint: remotePort or remoteSocket")
+	}
+	if hasRemotePort && !isValidTCPPort(remotePort) {
+		return fmt.Errorf("invalid remote port %d", remotePort)
+	}
+	if hasRemoteSocket {
+		if !strings.HasPrefix(forward.RemoteSocket, "/") {
+			return fmt.Errorf("remoteSocket must be an absolute Unix socket path")
+		}
+		if strings.Contains(forward.RemoteSocket, ":") {
+			return fmt.Errorf("remoteSocket cannot contain ':'")
+		}
+	}
+
+	return nil
+}
+
+func isValidTCPPort(port int) bool {
+	return port > 0 && port <= 65535
+}
+
+func (f ReversePortForward) effectiveLocalPort() int {
+	if f.LocalPort != 0 {
+		return f.LocalPort
+	}
+	return f.Port
+}
+
+func (f ReversePortForward) effectiveRemotePort() int {
+	if f.RemotePort != 0 {
+		return f.RemotePort
+	}
+	if strings.TrimSpace(f.RemoteSocket) != "" {
+		return 0
+	}
+	if f.Port != 0 {
+		return f.Port
+	}
+	return f.LocalPort
+}
+
+func (f ReversePortForward) mergeKey() string {
+	if localPort := f.effectiveLocalPort(); localPort != 0 {
+		return fmt.Sprintf("tcp:%d", localPort)
+	}
+	return "unix:" + strings.TrimSpace(f.LocalSocket)
+}
+
+func (f ReversePortForward) withExpandedRemoteSocket() ReversePortForward {
+	f = normalizeReversePortForward(f)
+	if strings.Contains(f.RemoteSocket, reverseForwardGUIDPlaceholder) {
+		id := uuid.NewString()
+		f.RemoteSocket = strings.ReplaceAll(f.RemoteSocket, reverseForwardGUIDPlaceholder, id)
+	}
+	return f
+}
+
+// LocalSpec returns the OpenSSH local endpoint spec for this reverse forward.
+func (f ReversePortForward) LocalSpec() string {
+	if localSocket := strings.TrimSpace(f.LocalSocket); localSocket != "" {
+		return localSocket
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(f.effectiveLocalPort()))
+}
+
+// RemoteSpec returns the OpenSSH remote endpoint spec for this reverse forward.
+func (f ReversePortForward) RemoteSpec() string {
+	if remoteSocket := strings.TrimSpace(f.RemoteSocket); remoteSocket != "" {
+		return remoteSocket
+	}
+	return strconv.Itoa(f.effectiveRemotePort())
+}
+
+func (f ReversePortForward) localLabel() string {
+	if localSocket := strings.TrimSpace(f.LocalSocket); localSocket != "" {
+		return "socket " + localSocket
+	}
+	return "port " + strconv.Itoa(f.effectiveLocalPort())
+}
+
+func (f ReversePortForward) remoteLabel() string {
+	if remoteSocket := strings.TrimSpace(f.RemoteSocket); remoteSocket != "" {
+		return "remote socket " + remoteSocket
+	}
+	return "remote port " + strconv.Itoa(f.effectiveRemotePort())
 }
 
 const portProbeTimeout = 150 * time.Millisecond
@@ -76,6 +208,32 @@ func isPortBoundWithTimeout(port int, timeout time.Duration) bool {
 	return true
 }
 
+func isUnixSocketBound(path string) bool {
+	return isUnixSocketBoundWithTimeout(path, portProbeTimeout)
+}
+
+func isUnixSocketBoundWithTimeout(path string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "unix", path)
+	if err != nil {
+		return false
+	}
+	if err := conn.Close(); err != nil {
+		logDebug("close socket probe connection for %s: %v", path, err)
+	}
+	return true
+}
+
+func isReverseForwardEndpointBound(forward ReversePortForward) bool {
+	if localSocket := strings.TrimSpace(forward.LocalSocket); localSocket != "" {
+		return isUnixSocketBound(localSocket)
+	}
+	return isPortBound(forward.effectiveLocalPort())
+}
+
 // GetBoundReverseForwards returns the subset of WellKnownPorts that should be
 // reverse-forwarded based on local availability or the AlwaysForward flag.
 func GetBoundReverseForwards() []ReversePortForward {
@@ -87,6 +245,11 @@ func GetBoundReverseForwards() []ReversePortForward {
 	var wg sync.WaitGroup
 
 	for i, forward := range forwards {
+		if err := validateReversePortForward(forward); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: skipping reverse port forward %q: %v\n", forward.Description, err)
+			continue
+		}
+		forwards[i] = forward.withExpandedRemoteSocket()
 		if !forward.Enabled {
 			continue
 		}
@@ -96,12 +259,12 @@ func GetBoundReverseForwards() []ReversePortForward {
 		}
 
 		wg.Add(1)
-		go func(i int, port int) {
+		go func(i int, forward ReversePortForward) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			bound[i] = isPortBound(port)
-		}(i, forward.Port)
+			bound[i] = isReverseForwardEndpointBound(forward)
+		}(i, forwards[i])
 	}
 	wg.Wait()
 
@@ -124,18 +287,21 @@ func LogReverseForwards(forwards []ReversePortForward) {
 	fmt.Fprintf(os.Stderr, "Reverse port forwarding:\n")
 	for _, forward := range forwards {
 		if forward.AlwaysForward {
-			fmt.Fprintf(os.Stderr, "  • %s (port %d) → always forwarded\n", forward.Description, forward.Port)
+			fmt.Fprintf(os.Stderr, "  • %s (%s → %s) → always forwarded\n", forward.Description, forward.localLabel(), forward.remoteLabel())
 		} else {
-			fmt.Fprintf(os.Stderr, "  • %s (port %d) → detected locally\n", forward.Description, forward.Port)
+			fmt.Fprintf(os.Stderr, "  • %s (%s → %s) → detected locally\n", forward.Description, forward.localLabel(), forward.remoteLabel())
 		}
 	}
 }
 
-// IsReverseForwardedPort reports whether a port is part of the active
+// IsReverseForwardedPort reports whether a remote TCP port is part of the active
 // reverse-forward set. Used by the port monitor to avoid double-forwarding.
 func IsReverseForwardedPort(port int) bool {
 	for _, forward := range WellKnownPorts {
-		if forward.Port == port && forward.Enabled {
+		if err := validateReversePortForward(forward); err != nil {
+			continue
+		}
+		if forward.effectiveRemotePort() == port && forward.Enabled {
 			return true
 		}
 	}
@@ -145,8 +311,13 @@ func IsReverseForwardedPort(port int) bool {
 func reverseForwardedPortSet() map[int]struct{} {
 	ports := make(map[int]struct{}, len(WellKnownPorts))
 	for _, forward := range WellKnownPorts {
+		if err := validateReversePortForward(forward); err != nil {
+			continue
+		}
 		if forward.Enabled {
-			ports[forward.Port] = struct{}{}
+			if port := forward.effectiveRemotePort(); port != 0 {
+				ports[port] = struct{}{}
+			}
 		}
 	}
 	return ports

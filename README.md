@@ -101,7 +101,9 @@ on macOS, `%AppData%` on Windows.) Override the path with the
 ```json
 {
   "reversePortForward": [
-    { "port": 8081, "description": "Custom service", "enabled": true }
+    { "port": 8081, "description": "Same port on both sides", "enabled": true },
+    { "localPort": 3000, "remotePort": 13000, "description": "Alternate remote port", "enabled": true },
+    { "localPort": 8080, "remoteSocket": "/tmp/my-service-$GUID.sock", "description": "Remote socket", "enabled": true }
   ],
   "installXdgOpen": false,
   "hosts": {
@@ -117,7 +119,12 @@ on macOS, `%AppData%` on Windows.) Override the path with the
 
 - `reversePortForward` entries are merged in this order: built-in defaults
   → top-level config → per-host overrides. Later entries override earlier
-  ones by port number.
+  ones by local endpoint.
+- `port` is the legacy shorthand for forwarding local TCP port `N` to remote
+  TCP port `N`. Use `localPort` with `remotePort` to expose a local service on
+  a different remote port, or `localPort` with `remoteSocket` to expose it as a
+  remote Unix socket. `$GUID` in `remoteSocket` is replaced with a per-forward
+  UUID when devssh starts.
 - devssh installs the `xdg-open` shim into `~/.local/bin/xdg-open` by
   default. Ensure `~/.local/bin` is on the remote `PATH`.
 - `installXdgOpen` defaults to `false`; when enabled, devssh also installs
