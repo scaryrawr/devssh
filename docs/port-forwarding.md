@@ -31,9 +31,10 @@ Common local services are surfaced to the remote automatically:
 | 9222 | Chrome DevTools | enabled |
 | 11434 | Ollama | enabled |
 
-When devssh starts it dials each configured local endpoint; any endpoint that's
-actually bound is reverse-forwarded into the remote. Legacy `port` entries
-appear as `localhost:<port>` via
+When devssh starts it checks each configured local TCP port or Unix socket. If
+the local endpoint is reachable, devssh adds an SSH reverse forward so the
+remote session can connect back to that local service. Legacy `port` entries
+appear on the remote as `localhost:<port>` via
 `ssh -O forward -R <port>:127.0.0.1:<port>`.
 
 ### Customizing the list
