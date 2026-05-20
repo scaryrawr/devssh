@@ -146,7 +146,11 @@ func TestLoadAppConfig(t *testing.T) {
 			name:       "valid structured config",
 			configPath: filepath.Join(tempDir, "structured.json"),
 			configData: `{
-"reversePortForward": [{"port": 8081, "description": "Top", "enabled": true}],
+"reversePortForward": [
+{"port": 8081, "description": "Top", "enabled": true},
+{"localPort": 8082, "remotePort": 18082, "description": "Alternate", "enabled": true},
+{"port": 8083, "remoteSocket": "/tmp/custom-$GUID.sock", "description": "Socket", "enabled": true}
+],
 "hosts": {
 "myserver": {
 "reversePortForward": [{"port": 9090, "description": "Host", "enabled": true}]
@@ -154,7 +158,11 @@ func TestLoadAppConfig(t *testing.T) {
 }
 }`,
 			expected: AppConfig{
-				ReversePortForward: []ReversePortForward{{Port: 8081, Description: "Top", Enabled: true}},
+				ReversePortForward: []ReversePortForward{
+					{Port: 8081, Description: "Top", Enabled: true},
+					{LocalPort: 8082, RemotePort: 18082, Description: "Alternate", Enabled: true},
+					{Port: 8083, RemoteSocket: "/tmp/custom-$GUID.sock", Description: "Socket", Enabled: true},
+				},
 				Hosts: map[string]HostConfig{
 					"myserver": {
 						ReversePortForward: []ReversePortForward{{Port: 9090, Description: "Host", Enabled: true}},
@@ -215,6 +223,8 @@ func TestSaveAppConfig_RoundTrip(t *testing.T) {
 	config := AppConfig{
 		ReversePortForward: []ReversePortForward{
 			{Port: 8081, Description: "Top", Enabled: true},
+			{LocalPort: 8082, RemotePort: 18082, Description: "Alternate", Enabled: true},
+			{Port: 8083, RemoteSocket: "/tmp/custom-$GUID.sock", Description: "Socket", Enabled: true},
 		},
 		InstallXdgOpen: &tval,
 		Hosts: map[string]HostConfig{
