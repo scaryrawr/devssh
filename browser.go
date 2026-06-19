@@ -1,10 +1,11 @@
-package main
+package devssh
 
 import (
 	"context"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -26,6 +27,7 @@ type BrowserService struct {
 	SocketPath string
 	server     *http.Server
 	listener   net.Listener
+	stderr     io.Writer
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
@@ -33,6 +35,15 @@ type BrowserService struct {
 
 // NewBrowserService starts the local HTTP browser service.
 func NewBrowserService(ctx context.Context) (*BrowserService, error) {
+	return NewBrowserServiceWithStderr(ctx, os.Stderr)
+}
+
+// NewBrowserServiceWithStderr starts the local HTTP browser service and writes
+// user-facing browser warnings to stderr.
+func NewBrowserServiceWithStderr(ctx context.Context, stderr io.Writer) (*BrowserService, error) {
+	if stderr == nil {
+		stderr = os.Stderr
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local listener: %w", err)
@@ -51,6 +62,7 @@ func NewBrowserService(ctx context.Context) (*BrowserService, error) {
 		Port:       browserPort,
 		SocketPath: socketPath,
 		listener:   listener,
+		stderr:     stderr,
 		ctx:        serviceCtx,
 		cancel:     cancel,
 	}
@@ -106,13 +118,13 @@ func (bs *BrowserService) handleOpenURL(w http.ResponseWriter, r *http.Request) 
 
 	if err := browser.OpenURL(url); err != nil {
 		logDebug("Error opening browser: %v", err)
-		fmt.Fprintf(os.Stderr, "Warning: failed to open browser for URL: %s (%v)\n", url, err)
+		fmt.Fprintf(bs.stderr, "Warning: failed to open browser for URL: %s (%v)\n", url, err)
 		http.Error(w, "Failed to open browser", http.StatusInternalServerError)
 		return
 	}
 
 	logDebug("Successfully opened URL in browser")
-	fmt.Fprintf(os.Stderr, "Opened in browser: %s\n", url)
+	fmt.Fprintf(bs.stderr, "Opened in browser: %s\n", url)
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("OK")); err != nil {
 		logDebug("write browser response: %v", err)

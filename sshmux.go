@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"bytes"
@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 type Mux struct {
 	Host       string
 	SocketPath string
+	SSHOptions []string
 
 	stopOnce sync.Once
 	stopErr  error
@@ -89,7 +91,7 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 	}
 	logElapsed("ssh ControlMaster command", start)
 
-	m := &Mux{Host: host, SocketPath: socket}
+	m := &Mux{Host: host, SocketPath: socket, SSHOptions: append([]string(nil), extraOpts...)}
 
 	start = time.Now()
 	if err := m.Check(); err != nil {
@@ -107,12 +109,14 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 // muxBaseOpts returns the SSH options applied to every command run against
 // the established master socket.
 func (m *Mux) muxBaseOpts() []string {
-	return []string{
+	args := []string{
 		"-S", m.SocketPath,
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=" + m.SocketPath,
-		"-o", "BatchMode=yes",
 	}
+	args = append(args, m.SSHOptions...)
+	args = append(args, "-o", "BatchMode=yes")
+	return args
 }
 
 // Check verifies the master is reachable using `ssh -O check`.
@@ -210,18 +214,25 @@ func (m *Mux) CancelRemoteForward(remoteSpec, localSpec string) error {
 //
 // stdio is wired straight through to the calling process.
 func (m *Mux) InteractiveShell(ctx context.Context, extraArgs []string) error {
+	return m.InteractiveShellWithStdio(ctx, extraArgs, os.Stdin, os.Stdout, os.Stderr)
+}
+
+// InteractiveShellWithStdio hands control to an interactive ssh session over
+// the existing master using caller-provided stdio streams.
+func (m *Mux) InteractiveShellWithStdio(ctx context.Context, extraArgs []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	args := []string{
 		"-S", m.SocketPath,
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=" + m.SocketPath,
 		"-t",
-		m.Host,
 	}
+	args = append(args, m.SSHOptions...)
+	args = append(args, m.Host)
 	args = append(args, extraArgs...)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	return cmd.Run()
 }
 

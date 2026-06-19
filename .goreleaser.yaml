@@ -8,7 +8,7 @@ before:
 
 builds:
   - id: devssh
-    main: .
+    main: ./cmd/devssh
     binary: devssh
     env:
       - CGO_ENABLED=0

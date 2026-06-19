@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"os"
@@ -92,4 +92,65 @@ func TestParseArgs_ExtraPositionalArgsTreatedAsRemaining(t *testing.T) {
 			t.Errorf("RemainingArgs = %v, want %v", got.RemainingArgs, want)
 		}
 	})
+}
+
+func TestCommandLineArgsSessionOptionsMapsCLIFlagsAndConfig(t *testing.T) {
+	trueValue := true
+	args := CommandLineArgs{
+		Host:            "devpod-generated",
+		InstallXdgOpen:  false,
+		NoXdgOpen:       true,
+		NoPortMonitor:   true,
+		NoBrowser:       true,
+		NoNotifications: true,
+		Verbose:         true,
+		RemainingArgs:   []string{"-L", "3000:localhost:3000", "tmux"},
+	}
+	cfg := AppConfig{
+		InstallXdgOpen: &trueValue,
+		ReversePortForward: []ReversePortForward{
+			{Port: 1234, Description: "disabled default", Enabled: false},
+		},
+		Hosts: map[string]HostConfig{
+			"devpod-generated": {
+				ReversePortForward: []ReversePortForward{
+					{LocalPort: 8080, RemotePort: 18080, Description: "host service", Enabled: true},
+				},
+			},
+		},
+	}
+
+	opts := args.SessionOptions(cfg)
+
+	if opts.Host != args.Host {
+		t.Fatalf("Host = %q, want %q", opts.Host, args.Host)
+	}
+	if !opts.DisableBrowser || !opts.DisableNotifications || !opts.DisablePortMonitor || !opts.DisableXdgOpen {
+		t.Fatalf("disable flags were not mapped: %+v", opts)
+	}
+	if !opts.InstallXdgOpen {
+		t.Fatal("expected config installXdgOpen to enable system xdg-open install")
+	}
+	if !opts.Verbose {
+		t.Fatal("expected verbose flag to map")
+	}
+	if !reflect.DeepEqual(opts.SSHArgs, args.RemainingArgs) {
+		t.Fatalf("SSHArgs = %v, want %v", opts.SSHArgs, args.RemainingArgs)
+	}
+	if !opts.DisableDefaultReversePortForwards {
+		t.Fatal("expected CLI to pass a fully merged reverse-forward list")
+	}
+
+	byLocal := make(map[int]ReversePortForward)
+	for _, forward := range opts.ReversePortForwards {
+		if port := forward.effectiveLocalPort(); port != 0 {
+			byLocal[port] = forward
+		}
+	}
+	if got := byLocal[1234]; got.Enabled {
+		t.Fatalf("expected config to disable default 1234 forward, got %+v", got)
+	}
+	if got := byLocal[8080]; got.RemotePort != 18080 || !got.Enabled {
+		t.Fatalf("expected host-specific forward to be included, got %+v", got)
+	}
 }

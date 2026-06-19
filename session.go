@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"fmt"

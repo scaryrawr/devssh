@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"bufio"
@@ -53,20 +53,25 @@ func (pmc *PortMonitorController) Wait() {
 	}
 }
 
-// StartPortMonitor launches the remote port monitor over the existing Mux
-// and starts forwarding any detected listening ports back to the local
-// machine via mux.AddLocalForward.
-func StartPortMonitor(ctx context.Context, mux *Mux) (*PortMonitorController, error) {
+// StartPortMonitor launches the remote port monitor over the existing Mux and
+// starts forwarding detected listening ports back to the local machine via
+// mux.AddLocalForward. The optional reverseForwards argument identifies remote
+// ports already covered by reverse forwards so they are not double-forwarded.
+func StartPortMonitor(ctx context.Context, mux *Mux, reverseForwards ...[]ReversePortForward) (*PortMonitorController, error) {
 	logDebug("Starting port monitor over Mux for host %s", mux.Host)
 
 	monitorCtx, cancel := context.WithCancel(ctx)
+	forwardsToSkip := WellKnownPorts
+	if len(reverseForwards) > 0 {
+		forwardsToSkip = append([]ReversePortForward(nil), reverseForwards[0]...)
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 
 	go func() {
 		defer wg.Done()
 		logDebug("Port monitor goroutine started")
-		if err := runPortMonitor(monitorCtx, mux); err != nil &&
+		if err := runPortMonitor(monitorCtx, mux, forwardsToSkip); err != nil &&
 			err != context.Canceled &&
 			!strings.Contains(err.Error(), "context canceled") {
 			logDebug("Port monitor exited with error: %v", err)
@@ -121,9 +126,9 @@ func (a *activeForwards) snapshot() []int {
 	return out
 }
 
-// runPortMonitor invokes ~/port-monitor.sh remotely and processes its
-// stdout, opening / closing local forwards in response.
-func runPortMonitor(ctx context.Context, mux *Mux) error {
+// runPortMonitor invokes ~/port-monitor.sh remotely and processes its stdout,
+// opening / closing local forwards in response.
+func runPortMonitor(ctx context.Context, mux *Mux, reverseForwards []ReversePortForward) error {
 	cmd := mux.Command(ctx, "~/port-monitor.sh")
 
 	stdout, err := cmd.StdoutPipe()
@@ -147,7 +152,7 @@ func runPortMonitor(ctx context.Context, mux *Mux) error {
 	}()
 
 	forwards := newActiveForwards()
-	reverseForwardedPorts := reverseForwardedPortSet()
+	reverseForwardedPorts := reverseForwardedPortSet(reverseForwards)
 	defer cleanupForwards(mux, forwards)
 
 	done := make(chan struct{})

@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"encoding/json"
@@ -74,12 +74,18 @@ func LoadAppConfig() (AppConfig, error) {
 // ReversePortForwardsForHost returns defaults merged with top-level and
 // per-host overrides for the given host alias.
 func (c AppConfig) ReversePortForwardsForHost(host string) []ReversePortForward {
+	return c.ReversePortForwardsForHostWithDefaults(host, WellKnownPorts)
+}
+
+// ReversePortForwardsForHostWithDefaults returns defaults merged with
+// top-level and per-host overrides for the given host alias.
+func (c AppConfig) ReversePortForwardsForHostWithDefaults(host string, defaults []ReversePortForward) []ReversePortForward {
 	hostForwards := []ReversePortForward(nil)
 	if hc, ok := c.Hosts[host]; ok {
 		hostForwards = hc.ReversePortForward
 	}
 
-	return MergeReversePortForwards(WellKnownPorts, c.ReversePortForward, hostForwards)
+	return MergeReversePortForwards(defaults, c.ReversePortForward, hostForwards)
 }
 
 // InstallXdgOpenForHost reports whether the xdg-open shim should also be
