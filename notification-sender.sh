@@ -160,6 +160,10 @@ __notification_handle_command_completion() {
     __notification_cmd_start_time=0
 }
 
+__notification_start_command_timer() {
+    __notification_cmd_start_time=$(date +%s)
+}
+
 # Bash-specific hooks
 if [ -n "$BASH_VERSION" ]; then
     # Track if we're in a command execution to avoid nested timing
@@ -170,7 +174,7 @@ if [ -n "$BASH_VERSION" ]; then
         # Only set start time if we're not already in a command
         # This prevents nested commands from overwriting the start time
         if [ $__notification_in_command -eq 0 ]; then
-            __notification_cmd_start_time=$(date +%s)
+            __notification_start_command_timer
             __notification_in_command=1
         fi
     }
@@ -203,7 +207,7 @@ fi
 if [ -n "$ZSH_VERSION" ]; then
     # Function called before each command
     __notification_preexec() {
-        __notification_cmd_start_time=$(date +%s)
+        __notification_start_command_timer
     }
     
     # Function called after each command

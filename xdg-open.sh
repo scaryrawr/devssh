@@ -42,24 +42,27 @@ find_real_xdg_open() {
     return 1
 }
 
-# real_xdg_open: call the system xdg-open without recursing into this shim.
+# real_xdg_open: call or exec the system xdg-open without recursing into this shim.
 real_xdg_open() {
-    local real
-    real="$(find_real_xdg_open)" || return 1
-    "$real" "$@"
-}
+    local mode="call"
+    if [[ "${1:-}" == "--exec" ]]; then
+        mode="exec"
+        shift
+    fi
 
-# exec_real_xdg_open: replace this shim with the system xdg-open.
-exec_real_xdg_open() {
     local real
     real="$(find_real_xdg_open)" || return 1
-    exec "$real" "$@"
+
+    if [[ "$mode" == "exec" ]]; then
+        exec "$real" "$@"
+    fi
+    "$real" "$@"
 }
 
 # Outside SSH, behave exactly like the system xdg-open instead of applying any
 # devssh-specific URL/file handling.
 if ! has_ssh_connection; then
-    exec_real_xdg_open "$@" || exit $?
+    real_xdg_open --exec "$@" || exit $?
 fi
 
 TARGET="${1:-}"
