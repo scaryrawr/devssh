@@ -1,207 +1,312 @@
-package main
+package devssh
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 )
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+// Options configures a devssh session started by NewSession or Run.
+//
+// Host is the OpenSSH host alias or target to pass to ssh. It may be any
+// normal OpenSSH destination, including a Host entry generated in an SSH config
+// file by another tool. SSHOptions are appended to the ControlMaster ssh
+// command before Host, which is where callers can pass inputs such as
+// "-F", "/path/to/config". SSHArgs are appended to the final interactive ssh
+// command after Host and may contain extra ssh flags or a remote command.
+type Options struct {
+	Host       string
+	SSHOptions []string
+	SSHArgs    []string
+
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+
+	DisableBrowser                    bool
+	DisableNotifications              bool
+	DisablePortMonitor                bool
+	DisableXdgOpen                    bool
+	DisableDefaultReversePortForwards bool
+	InstallXdgOpen                    bool
+	ReversePortForwards               []ReversePortForward
+	Verbose                           bool
+}
+
+// DefaultOptions returns Options populated with the same feature defaults used
+// by the devssh CLI. The returned value can be modified before calling Run.
+func DefaultOptions(host string) Options {
+	return Options{
+		Host:   strings.TrimSpace(host),
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
 	}
 }
 
-func run() error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// Session owns a live devssh ControlMaster and all helper services/forwards
+// started for a host. Call Close when the session is no longer needed.
+type Session struct {
+	options         Options
+	mux             *Mux
+	browserSvc      *BrowserService
+	notifySvc       *NotificationService
+	monitor         *PortMonitorController
+	reverseForwards []ReversePortForward
+	logDir          string
+	closeOnce       sync.Once
+	closeErr        error
+}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		cancel()
+var sessionStateMu sync.Mutex
+
+// NewSession starts the devssh ControlMaster, remote preflight, local helper
+// services, remote forwards, helper script upload, and optional port monitor.
+// It does not start the final interactive ssh command; call Interactive for
+// that, or use Run to do both with automatic cleanup.
+func NewSession(ctx context.Context, opts Options) (*Session, error) {
+	opts = normalizeOptions(opts)
+	if opts.Host == "" {
+		return nil, fmt.Errorf("host is required")
+	}
+
+	sessionStateMu.Lock()
+	initializeSessionID(opts.Host)
+	if err := initDebugLogger(); err != nil {
+		fmt.Fprintf(opts.Stderr, "Warning: failed to initialize debug logger: %v\n", err)
+	}
+
+	s := &Session{
+		options:         opts,
+		reverseForwards: reverseForwardsForOptions(opts),
+		logDir:          getSessionLogDirectory(),
+	}
+
+	logDebug("devssh starting for host %q", opts.Host)
+	startupStart := time.Now()
+	if opts.Verbose {
+		fmt.Fprintf(opts.Stderr, "Logs: %s\n", s.logDir)
+	}
+
+	if err := s.start(ctx); err != nil {
+		if closeErr := s.Close(); closeErr != nil {
+			logDebug("cleanup after startup error: %v", closeErr)
+		}
+		return nil, err
+	}
+	logElapsed("startup before interactive shell", startupStart)
+	return s, nil
+}
+
+// Run starts a devssh session, runs the final interactive ssh invocation, and
+// closes the session before returning.
+func Run(ctx context.Context, opts Options) error {
+	session, err := NewSession(ctx, opts)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := session.Close(); err != nil {
+			logDebug("session.Close: %v", err)
+		}
 	}()
+	return session.Interactive(ctx)
+}
 
-	args := ParseArgs()
+// Interactive hands control to the final ssh invocation using the session's
+// configured SSHArgs and stdio.
+func (s *Session) Interactive(ctx context.Context) error {
+	if s == nil || s.mux == nil {
+		return fmt.Errorf("session is not started")
+	}
+	return s.mux.InteractiveShellWithStdio(ctx, s.options.SSHArgs, s.options.Stdin, s.options.Stdout, s.options.Stderr)
+}
 
-	if args.Logs {
-		ListRecentLogFiles()
+// Close stops the port monitor, local helper services, ControlMaster, and
+// debug log. It is safe to call more than once for the underlying Mux.
+func (s *Session) Close() error {
+	if s == nil {
 		return nil
 	}
-
-	cfg, err := LoadAppConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to load config: %v\n", err)
-		cfg = AppConfig{}
-	}
-
-	// Resolve host (picker if not provided).
-	host := args.Host
-	if host == "" {
-		picked, err := SelectHost()
-		if err != nil {
-			return fmt.Errorf("select host: %w", err)
+	s.closeOnce.Do(func() {
+		defer sessionStateMu.Unlock()
+		if s.monitor != nil {
+			s.monitor.Stop()
+			s.monitor.Wait()
+			s.monitor = nil
 		}
-		host = picked
+		if s.notifySvc != nil {
+			s.notifySvc.Stop()
+			s.notifySvc = nil
+		}
+		if s.browserSvc != nil {
+			s.browserSvc.Stop()
+			s.browserSvc = nil
+		}
+
+		if s.mux != nil {
+			s.closeErr = s.mux.Stop()
+			s.mux = nil
+		}
+		closeDebugLogger()
+	})
+	return s.closeErr
+}
+
+// LogDirectory returns the session-specific directory containing debug logs.
+func (s *Session) LogDirectory() string {
+	if s == nil {
+		return ""
 	}
+	return s.logDir
+}
 
-	// Merge config defaults + host overrides.
-	WellKnownPorts = cfg.ReversePortForwardsForHost(host)
-	installXdg := args.InstallXdgOpen || cfg.InstallXdgOpenForHost(host)
-
-	// Initialize logging now that we have a host.
-	initializeSessionID(host)
-	if err := initDebugLogger(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to initialize debug logger: %v\n", err)
+// Mux returns the underlying OpenSSH ControlMaster wrapper for advanced
+// callers that need to run additional commands or manage forwards directly.
+func (s *Session) Mux() *Mux {
+	if s == nil {
+		return nil
 	}
-	defer closeDebugLogger()
-	logDebug("devssh starting for host %q", host)
-	startupStart := time.Now()
+	return s.mux
+}
 
-	if args.Verbose {
-		fmt.Fprintf(os.Stderr, "Logs: %s\n", getSessionLogDirectory())
-	}
-
-	// Start the ssh ControlMaster.
-	fmt.Fprintf(os.Stderr, "Connecting to %s...\n", host)
+func (s *Session) start(ctx context.Context) error {
+	fmt.Fprintf(s.options.Stderr, "Connecting to %s...\n", s.options.Host)
 	start := time.Now()
-	mux, err := StartMux(ctx, host, nil)
+	mux, err := StartMux(ctx, s.options.Host, s.options.SSHOptions)
 	logElapsed("start ssh master", start)
 	if err != nil {
 		return fmt.Errorf("start ssh master: %w", err)
 	}
-	defer func() {
-		if err := mux.Stop(); err != nil {
-			logDebug("mux.Stop: %v", err)
-		}
-	}()
+	s.mux = mux
 
-	// Preflight remote: warn (don't fail) on missing optional deps.
 	start = time.Now()
-	preflightRemote(ctx, mux)
+	preflightRemote(ctx, mux, s.options.Stderr)
 	logElapsed("remote preflight", start)
 
-	// Local services (best-effort; failures degrade gracefully).
-	var browserSvc *BrowserService
-	if !args.NoBrowser {
+	if !s.options.DisableBrowser {
 		start = time.Now()
-		if svc, err := NewBrowserService(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to start browser service: %v\n", err)
+		if svc, err := NewBrowserServiceWithStderr(ctx, s.options.Stderr); err != nil {
+			fmt.Fprintf(s.options.Stderr, "Warning: failed to start browser service: %v\n", err)
 		} else {
-			browserSvc = svc
-			defer browserSvc.Stop()
+			s.browserSvc = svc
 		}
 		logElapsed("start browser service", start)
 	}
 
-	var notifySvc *NotificationService
-	if !args.NoNotifications {
+	if !s.options.DisableNotifications {
 		start = time.Now()
 		if svc, err := NewNotificationService(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to start notification service: %v\n", err)
+			fmt.Fprintf(s.options.Stderr, "Warning: failed to start notification service: %v\n", err)
 		} else {
-			notifySvc = svc
-			defer notifySvc.Stop()
+			s.notifySvc = svc
 		}
 		logElapsed("start notification service", start)
 	}
 
-	// Stream-local remote forwards for the services. If either fails, disable
-	// that feature and continue.
-	if browserSvc != nil {
+	if s.browserSvc != nil {
 		start = time.Now()
-		if err := mux.AddRemoteForward(browserSvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", browserSvc.Port)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to forward browser socket (browser opening disabled): %v\n", err)
-			browserSvc.Stop()
-			browserSvc = nil
+		if err := mux.AddRemoteForward(s.browserSvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", s.browserSvc.Port)); err != nil {
+			fmt.Fprintf(s.options.Stderr, "Warning: failed to forward browser socket (browser opening disabled): %v\n", err)
+			s.browserSvc.Stop()
+			s.browserSvc = nil
 		}
 		logElapsed("forward browser socket", start)
 	}
-	if notifySvc != nil {
+	if s.notifySvc != nil {
 		start = time.Now()
-		if err := mux.AddRemoteForward(notifySvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", notifySvc.Port)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to forward notification socket (notifications disabled): %v\n", err)
-			notifySvc.Stop()
-			notifySvc = nil
+		if err := mux.AddRemoteForward(s.notifySvc.SocketPath, fmt.Sprintf("127.0.0.1:%d", s.notifySvc.Port)); err != nil {
+			fmt.Fprintf(s.options.Stderr, "Warning: failed to forward notification socket (notifications disabled): %v\n", err)
+			s.notifySvc.Stop()
+			s.notifySvc = nil
 		}
 		logElapsed("forward notification socket", start)
 	}
 
-	// Reverse-forward local AI services (LM Studio, Ollama, ...).
 	start = time.Now()
-	boundForwards := GetBoundReverseForwards()
+	boundForwards := GetBoundReverseForwardsFrom(s.reverseForwards)
 	logElapsed("probe reverse forward ports", start)
 	if len(boundForwards) > 0 {
-		LogReverseForwards(boundForwards)
+		LogReverseForwardsTo(s.options.Stderr, boundForwards)
 		for _, fw := range boundForwards {
 			remote := fw.RemoteSpec()
 			local := fw.LocalSpec()
 			start = time.Now()
 			if err := mux.AddRemoteForward(remote, local); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to forward %s to %s: %v\n", fw.localLabel(), fw.remoteLabel(), err)
+				fmt.Fprintf(s.options.Stderr, "Warning: failed to forward %s to %s: %v\n", fw.localLabel(), fw.remoteLabel(), err)
 			}
 			logElapsed(fmt.Sprintf("forward reverse %s to %s", fw.localLabel(), fw.remoteLabel()), start)
 		}
 	}
 
-	// Upload helper scripts to the remote in a single shell command.
 	start = time.Now()
 	if err := prepareRemoteScripts(ctx, mux, prepareOpts{
-		hasBrowser:      browserSvc != nil,
-		hasNotification: notifySvc != nil,
-		installXdgOpen:  installXdg,
-		uploadXdgOpen:   !args.NoXdgOpen,
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to upload helper scripts: %v\n", err)
+		hasBrowser:      s.browserSvc != nil,
+		hasNotification: s.notifySvc != nil,
+		installXdgOpen:  s.options.InstallXdgOpen,
+		uploadXdgOpen:   !s.options.DisableXdgOpen,
+	}, s.options.Stderr); err != nil {
+		fmt.Fprintf(s.options.Stderr, "Warning: failed to upload helper scripts: %v\n", err)
 	}
 	logElapsed("prepare remote scripts", start)
 
-	if notifySvc != nil {
-		fmt.Fprintf(os.Stderr, "Command completion notifications available! To enable, add to your shell config:\n")
-		fmt.Fprintf(os.Stderr, "  # bash (~/.bashrc) or zsh (~/.zshrc)\n")
-		fmt.Fprintf(os.Stderr, "  if [ -f \"$HOME/notification-sender.sh\" ]; then\n")
-		fmt.Fprintf(os.Stderr, "      source \"$HOME/notification-sender.sh\"\n")
-		fmt.Fprintf(os.Stderr, "  fi\n")
-		fmt.Fprintf(os.Stderr, "  # fish with the done plugin (~/.config/fish/config.fish)\n")
-		fmt.Fprintf(os.Stderr, "  set -U __done_allow_nongraphical 1\n")
-		fmt.Fprintf(os.Stderr, "  set -U __done_notification_command \"~/notification-sender.sh send \\$title \\$message\"\n\n")
+	if s.notifySvc != nil {
+		fmt.Fprintf(s.options.Stderr, "Command completion notifications available! To enable, add to your shell config:\n")
+		fmt.Fprintf(s.options.Stderr, "  # bash (~/.bashrc) or zsh (~/.zshrc)\n")
+		fmt.Fprintf(s.options.Stderr, "  if [ -f \"$HOME/notification-sender.sh\" ]; then\n")
+		fmt.Fprintf(s.options.Stderr, "      source \"$HOME/notification-sender.sh\"\n")
+		fmt.Fprintf(s.options.Stderr, "  fi\n")
+		fmt.Fprintf(s.options.Stderr, "  # fish with the done plugin (~/.config/fish/config.fish)\n")
+		fmt.Fprintf(s.options.Stderr, "  set -U __done_allow_nongraphical 1\n")
+		fmt.Fprintf(s.options.Stderr, "  set -U __done_notification_command \"~/notification-sender.sh send \\$title \\$message\"\n\n")
 	}
 
-	// Start the remote port monitor.
-	var monitor *PortMonitorController
-	if !args.NoPortMonitor {
+	if !s.options.DisablePortMonitor {
 		start = time.Now()
-		m, err := StartPortMonitor(ctx, mux)
+		monitor, err := StartPortMonitor(ctx, mux, s.reverseForwards)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to start port monitor: %v\n", err)
+			fmt.Fprintf(s.options.Stderr, "Warning: failed to start port monitor: %v\n", err)
 		} else {
-			monitor = m
+			s.monitor = monitor
 		}
 		logElapsed("start port monitor", start)
 	}
-	if monitor != nil {
-		defer func() {
-			monitor.Stop()
-			monitor.Wait()
-		}()
+
+	return nil
+}
+
+func normalizeOptions(opts Options) Options {
+	opts.Host = strings.TrimSpace(opts.Host)
+	if opts.Stdin == nil {
+		opts.Stdin = os.Stdin
 	}
+	if opts.Stdout == nil {
+		opts.Stdout = os.Stdout
+	}
+	if opts.Stderr == nil {
+		opts.Stderr = os.Stderr
+	}
+	opts.SSHOptions = append([]string(nil), opts.SSHOptions...)
+	opts.SSHArgs = append([]string(nil), opts.SSHArgs...)
+	opts.ReversePortForwards = append([]ReversePortForward(nil), opts.ReversePortForwards...)
+	return opts
+}
 
-	logElapsed("startup before interactive shell", startupStart)
-
-	// Hand control to the interactive shell.
-	return mux.InteractiveShell(ctx, args.RemainingArgs)
+func reverseForwardsForOptions(opts Options) []ReversePortForward {
+	if opts.DisableDefaultReversePortForwards {
+		return MergeReversePortForwards(opts.ReversePortForwards)
+	}
+	return MergeReversePortForwards(DefaultReversePortForwards(), opts.ReversePortForwards)
 }
 
 // preflightRemote runs a single SSH command to check for the optional remote
 // tools we depend on. Missing tools are warned-about but never fatal.
-func preflightRemote(ctx context.Context, mux *Mux) {
+func preflightRemote(ctx context.Context, mux *Mux, stderr io.Writer) {
 	const probe = "for t in bash jq ss curl base64 chmod; do command -v $t >/dev/null 2>&1 || echo MISSING:$t; done"
 	stdout, _, err := mux.Run(ctx, "sh", "-c", "'"+probe+"'")
 	if err != nil {
@@ -211,7 +316,7 @@ func preflightRemote(ctx context.Context, mux *Mux) {
 	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
 		if strings.HasPrefix(line, "MISSING:") {
 			tool := strings.TrimPrefix(line, "MISSING:")
-			fmt.Fprintf(os.Stderr, "Warning: remote is missing %q; some features may be disabled.\n", tool)
+			fmt.Fprintf(stderr, "Warning: remote is missing %q; some features may be disabled.\n", tool)
 		}
 	}
 }
@@ -267,7 +372,7 @@ func buildXdgOpenInstallCommand(binDir string) string {
 
 // prepareRemoteScripts writes all helper scripts to the remote in a single
 // SSH call using base64-encoded payloads.
-func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error {
+func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts, stderr io.Writer) error {
 	var cmdParts []string
 
 	portB64 := base64.StdEncoding.EncodeToString([]byte(portMonitorScript))
@@ -311,7 +416,6 @@ func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error
 		cmdParts = append(cmdParts, buildXdgOpenPathCheckCommand())
 	}
 
-	// Clean up stale sockets from prior sessions.
 	if cleanup := buildStaleSocketCleanupCommand(opts.hasBrowser, opts.hasNotification); cleanup != "" {
 		cmdParts = append(cmdParts, cleanup)
 	}
@@ -319,33 +423,33 @@ func prepareRemoteScripts(ctx context.Context, mux *Mux, opts prepareOpts) error
 	fullCmd := strings.Join(cmdParts, " && ")
 
 	wrapped := wrapBashLoginCommand(fullCmd)
-	stdout, stderr, err := mux.Run(ctx, wrapped...)
+	stdout, sshStderr, err := mux.Run(ctx, wrapped...)
 	if err != nil {
 		return fmt.Errorf("prepare remote scripts: %w (stdout: %s, stderr: %s)", err,
-			strings.TrimSpace(stdout), strings.TrimSpace(stderr))
+			strings.TrimSpace(stdout), strings.TrimSpace(sshStderr))
 	}
 
 	xdgOpenUserLinkConflict, xdgOpenResolvedPath := parseXdgOpenSetupStdout(stdout)
 
-	fmt.Fprintln(os.Stderr, "Helper scripts uploaded.")
+	fmt.Fprintln(stderr, "Helper scripts uploaded.")
 	if opts.uploadXdgOpen {
 		if xdgOpenUserLinkConflict == "" {
-			fmt.Fprintln(os.Stderr, "xdg-open shim installed at ~/.local/bin/xdg-open")
+			fmt.Fprintln(stderr, "xdg-open shim installed at ~/.local/bin/xdg-open")
 		} else {
-			fmt.Fprintln(os.Stderr, "xdg-open shim uploaded to ~/xdg-open.sh")
-			fmt.Fprintf(os.Stderr, "Warning: %s already exists and is not a symlink; leaving it unchanged.\n", xdgOpenUserLinkConflict)
+			fmt.Fprintln(stderr, "xdg-open shim uploaded to ~/xdg-open.sh")
+			fmt.Fprintf(stderr, "Warning: %s already exists and is not a symlink; leaving it unchanged.\n", xdgOpenUserLinkConflict)
 		}
 		if xdgOpenResolvedPath != "" {
-			fmt.Fprintf(os.Stderr, "Warning: xdg-open does not currently resolve to the devssh shim (resolved: %s).\n", xdgOpenResolvedPath)
-			fmt.Fprintln(os.Stderr, `Add this to your remote shell config: export PATH="$HOME/.local/bin:$PATH"`)
+			fmt.Fprintf(stderr, "Warning: xdg-open does not currently resolve to the devssh shim (resolved: %s).\n", xdgOpenResolvedPath)
+			fmt.Fprintln(stderr, `Add this to your remote shell config: export PATH="$HOME/.local/bin:$PATH"`)
 		}
 	}
 	if opts.installXdgOpen && opts.uploadXdgOpen {
-		fmt.Fprintln(os.Stderr, "xdg-open shim also installed at /usr/local/bin/xdg-open")
+		fmt.Fprintln(stderr, "xdg-open shim also installed at /usr/local/bin/xdg-open")
 	}
 	if opts.hasBrowser {
-		fmt.Fprintf(os.Stderr, "\nBrowser opener available! To enable browser forwarding, add to your shell config:\n")
-		fmt.Fprintf(os.Stderr, "  export BROWSER=\"$HOME/browser-opener.sh\"\n\n")
+		fmt.Fprintf(stderr, "\nBrowser opener available! To enable browser forwarding, add to your shell config:\n")
+		fmt.Fprintf(stderr, "  export BROWSER=\"$HOME/browser-opener.sh\"\n\n")
 	}
 	return nil
 }

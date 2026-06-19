@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"net"
@@ -216,6 +216,19 @@ func TestWellKnownPorts(t *testing.T) {
 		if !found {
 			t.Errorf("Expected port %d (%s) not found in WellKnownPorts", port, desc)
 		}
+	}
+}
+
+func TestDefaultReversePortForwardsReturnsCopy(t *testing.T) {
+	first := DefaultReversePortForwards()
+	second := DefaultReversePortForwards()
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatal("expected default reverse forwards")
+	}
+
+	first[0].Enabled = !second[0].Enabled
+	if first[0].Enabled == second[0].Enabled {
+		t.Fatal("expected caller mutations to not affect later defaults")
 	}
 }
 

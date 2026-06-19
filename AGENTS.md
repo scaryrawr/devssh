@@ -5,10 +5,10 @@ working on the devssh project.
 
 ## Project Overview
 
-`devssh` is a Go CLI that wraps `ssh` with port-forwarding, browser-opening,
-and desktop-notification helpers. It is a fork of `gh-ado-codespaces` with
-all GitHub CLI / Azure DevOps machinery removed; the only external command
-it shells out to is `ssh`.
+`devssh` is an importable Go library plus a CLI under `cmd/devssh` that wraps
+`ssh` with port-forwarding, browser-opening, and desktop-notification helpers.
+It is a fork of `gh-ado-codespaces` with all GitHub CLI / Azure DevOps
+machinery removed; the only external command it shells out to is `ssh`.
 
 The dominant runtime pattern is a single OpenSSH `ControlMaster` started at
 session start and used by every subsequent operation (script upload, port
@@ -20,15 +20,15 @@ monitor, dynamic port forwards, interactive shell). The `Mux` type in
 ### Build
 
 ```bash
-go build -v .
-go build -v -o devssh .
+go build -v ./...
+go build -v -o devssh ./cmd/devssh
 ```
 
 ### Test
 
 ```bash
 go test -v ./...                # all tests
-go test -v -race .              # race detector (CI standard)
+go test -v -race ./...          # race detector
 go test -short -v ./...         # skip integration tests
 go test -v -run TestFunctionName
 go test -v -cover ./...
@@ -84,13 +84,17 @@ Every interaction with the remote goes through `*Mux`:
 - `mux.AddRemoteForward(remoteSpec, localSpec)` /
   `mux.CancelRemoteForward` — dynamic `-R` forwards, including
   streamlocal Unix sockets.
-- `mux.InteractiveShell(ctx, extraArgs)` — the final interactive ssh.
+- `mux.InteractiveShell(ctx, extraArgs)` — the final interactive ssh using
+  process stdio.
+- `mux.InteractiveShellWithStdio(ctx, extraArgs, stdin, stdout, stderr)` —
+  the final interactive ssh using caller-provided stdio.
 - `mux.Stop()` — `ssh -O exit` + socket cleanup. Safe to call twice.
 
-User-supplied SSH flags (everything after `--`) are appended only to
-`InteractiveShell`. Internal commands always use `BatchMode=yes` and a
-known-good baseline of `-S socket -o ControlMaster=no
--o ControlPath=socket`.
+User-supplied CLI SSH flags (everything after `--`) are appended only to
+`InteractiveShell`. Library `Options.SSHOptions` are passed to the master and
+follow-up ssh invocations, which lets callers provide inputs such as
+`-F /path/to/config`. Internal commands always force `BatchMode=yes` and a
+known-good baseline of `-S socket -o ControlMaster=no -o ControlPath=socket`.
 
 ### Helper scripts
 
@@ -109,16 +113,18 @@ scripts agree on this prefix.
 
 - All log files live under
   `getSessionLogDirectory()` = `$TMPDIR/devssh/logs/<session-id>/`.
-- `sessionID` is set once via `initializeSessionID(hostAlias)` from
-  the resolved host name + timestamp + pid.
+- High-level `Session` creation serializes the process-wide legacy debug log
+  state; close sessions promptly so another high-level session can start.
 
 ### Configuration
 
 - Per-host overrides are keyed by the SSH alias (not the resolved
   hostname or `user@host`).
-- `cfg.ReversePortForwardsForHost(host)` returns the merged forward
-  list. Order: built-in `WellKnownPorts` → top-level `reversePortForward`
-  → host-specific overrides.
+- `cfg.ReversePortForwardsForHostWithDefaults(host, defaults)` returns the
+  merged forward list. Order: caller defaults → top-level
+  `reversePortForward` → host-specific overrides.
+- `WellKnownPorts` remains for compatibility, but new library callers should
+  use `DefaultReversePortForwards()` and `Options.ReversePortForwards`.
 
 ## Common Pitfalls to Avoid
 

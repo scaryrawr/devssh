@@ -1,4 +1,4 @@
-package main
+package devssh
 
 import (
 	"flag"
@@ -18,6 +18,22 @@ type CommandLineArgs struct {
 	NoNotifications bool
 	Verbose         bool
 	RemainingArgs   []string
+}
+
+// SessionOptions maps parsed CLI flags and app config to library session
+// options while preserving the devssh command-line defaults.
+func (a CommandLineArgs) SessionOptions(cfg AppConfig) Options {
+	opts := DefaultOptions(a.Host)
+	opts.SSHArgs = append([]string(nil), a.RemainingArgs...)
+	opts.DisableBrowser = a.NoBrowser
+	opts.DisableNotifications = a.NoNotifications
+	opts.DisablePortMonitor = a.NoPortMonitor
+	opts.DisableXdgOpen = a.NoXdgOpen
+	opts.InstallXdgOpen = a.InstallXdgOpen || cfg.InstallXdgOpenForHost(a.Host)
+	opts.Verbose = a.Verbose
+	opts.DisableDefaultReversePortForwards = true
+	opts.ReversePortForwards = cfg.ReversePortForwardsForHostWithDefaults(a.Host, DefaultReversePortForwards())
+	return opts
 }
 
 // ParseArgs parses os.Args[1:] and returns the resolved CommandLineArgs.

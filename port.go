@@ -1,8 +1,9 @@
-package main
+package devssh
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -25,13 +26,24 @@ type ReversePortForward struct {
 	AlwaysForward bool   `json:"alwaysForward"` // If true, forward even when the local endpoint is not bound
 }
 
-// WellKnownPorts defines commonly used local service ports that should be
-// reverse-forwarded into the remote session so the remote can reach them.
-var WellKnownPorts = []ReversePortForward{
+var defaultReversePortForwards = []ReversePortForward{
 	{Port: 1234, Description: "LM Studio", Enabled: true},
 	{Port: 9222, Description: "Chrome DevTools", Enabled: true},
 	{Port: 11434, Description: "Ollama", Enabled: true},
 }
+
+// DefaultReversePortForwards returns the built-in local service forwards that
+// devssh exposes to remote sessions by default.
+func DefaultReversePortForwards() []ReversePortForward {
+	return append([]ReversePortForward(nil), defaultReversePortForwards...)
+}
+
+// WellKnownPorts defines commonly used local service ports that should be
+// reverse-forwarded into the remote session so the remote can reach them.
+//
+// Deprecated: use DefaultReversePortForwards and Options.ReversePortForwards
+// instead of mutating this package-level variable.
+var WellKnownPorts = DefaultReversePortForwards()
 
 const reverseForwardGUIDPlaceholder = "$GUID"
 
@@ -236,8 +248,16 @@ func isReverseForwardEndpointBound(forward ReversePortForward) bool {
 
 // GetBoundReverseForwards returns the subset of WellKnownPorts that should be
 // reverse-forwarded based on local availability or the AlwaysForward flag.
+//
+// Deprecated: use GetBoundReverseForwardsFrom with an explicit forward list.
 func GetBoundReverseForwards() []ReversePortForward {
-	forwards := append([]ReversePortForward(nil), WellKnownPorts...)
+	return GetBoundReverseForwardsFrom(WellKnownPorts)
+}
+
+// GetBoundReverseForwardsFrom returns the subset of forwards that should be
+// reverse-forwarded based on local availability or the AlwaysForward flag.
+func GetBoundReverseForwardsFrom(forwards []ReversePortForward) []ReversePortForward {
+	forwards = append([]ReversePortForward(nil), forwards...)
 	bound := make([]bool, len(forwards))
 
 	const maxConcurrentProbes = 16
@@ -280,16 +300,22 @@ func GetBoundReverseForwards() []ReversePortForward {
 
 // LogReverseForwards prints a user-facing summary of detected reverse forwards.
 func LogReverseForwards(forwards []ReversePortForward) {
+	LogReverseForwardsTo(os.Stderr, forwards)
+}
+
+// LogReverseForwardsTo prints a user-facing summary of detected reverse
+// forwards to w.
+func LogReverseForwardsTo(w io.Writer, forwards []ReversePortForward) {
 	if len(forwards) == 0 {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "Reverse port forwarding:\n")
+	fmt.Fprintf(w, "Reverse port forwarding:\n")
 	for _, forward := range forwards {
 		if forward.AlwaysForward {
-			fmt.Fprintf(os.Stderr, "  • %s (%s → %s) → always forwarded\n", forward.Description, forward.localLabel(), forward.remoteLabel())
+			fmt.Fprintf(w, "  • %s (%s → %s) → always forwarded\n", forward.Description, forward.localLabel(), forward.remoteLabel())
 		} else {
-			fmt.Fprintf(os.Stderr, "  • %s (%s → %s) → detected locally\n", forward.Description, forward.localLabel(), forward.remoteLabel())
+			fmt.Fprintf(w, "  • %s (%s → %s) → detected locally\n", forward.Description, forward.localLabel(), forward.remoteLabel())
 		}
 	}
 }
@@ -297,7 +323,13 @@ func LogReverseForwards(forwards []ReversePortForward) {
 // IsReverseForwardedPort reports whether a remote TCP port is part of the active
 // reverse-forward set. Used by the port monitor to avoid double-forwarding.
 func IsReverseForwardedPort(port int) bool {
-	for _, forward := range WellKnownPorts {
+	return IsReverseForwardedPortIn(WellKnownPorts, port)
+}
+
+// IsReverseForwardedPortIn reports whether a remote TCP port is part of the
+// supplied reverse-forward set.
+func IsReverseForwardedPortIn(forwards []ReversePortForward, port int) bool {
+	for _, forward := range forwards {
 		if err := validateReversePortForward(forward); err != nil {
 			continue
 		}
@@ -308,9 +340,9 @@ func IsReverseForwardedPort(port int) bool {
 	return false
 }
 
-func reverseForwardedPortSet() map[int]struct{} {
-	ports := make(map[int]struct{}, len(WellKnownPorts))
-	for _, forward := range WellKnownPorts {
+func reverseForwardedPortSet(forwards []ReversePortForward) map[int]struct{} {
+	ports := make(map[int]struct{}, len(forwards))
+	for _, forward := range forwards {
 		if err := validateReversePortForward(forward); err != nil {
 			continue
 		}
