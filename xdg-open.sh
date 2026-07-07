@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# xdg-open shim for GitHub Codespaces (SSH environment)
+# xdg-open shim for remote development environments.
 #
-# Replaces the real xdg-open and intelligently routes SSH open requests:
+# Replaces the real xdg-open and intelligently routes remote open requests:
 #   - URLs  → forwarded via devssh browser socket, $BROWSER, VS Code, or silent no-op
 #   - Files → opened with an appropriate viewer (chafa, pdftotext, glow, bat, $EDITOR…)
-#             in a tmux pane (if available) or inline over SSH.
-# Outside SSH, immediately delegates to the real xdg-open.
+#             in a tmux pane (if available) or inline in the remote shell.
+# Outside a known remote environment, immediately delegates to the real xdg-open.
 #
 # Anti-recursion: this script never calls the first "xdg-open" from PATH.
 # When delegating to the real binary, it searches for an executable named
@@ -14,9 +14,10 @@
 
 set -euo pipefail
 
-# has_ssh_connection: returns 0 when running under an SSH session.
-has_ssh_connection() {
-    [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" ]]
+# has_remote_connection: returns 0 when running under SSH or a remote
+# devcontainer environment whose shell may not expose SSH markers.
+has_remote_connection() {
+    [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" || -n "${SSH_CLIENT:-}" || -n "${REMOTE_CONTAINERS:-}" || -n "${DEVPOD:-}" ]]
 }
 
 # find_real_xdg_open: print the first xdg-open executable that is not this shim.
@@ -59,9 +60,9 @@ real_xdg_open() {
     "$real" "$@"
 }
 
-# Outside SSH, behave exactly like the system xdg-open instead of applying any
-# devssh-specific URL/file handling.
-if ! has_ssh_connection; then
+# Outside a remote environment, behave exactly like the system xdg-open instead
+# of applying any devssh-specific URL/file handling.
+if ! has_remote_connection; then
     real_xdg_open --exec "$@" || exit $?
 fi
 
@@ -204,7 +205,7 @@ open_file() {
         fi
 
     else
-        # SSH session without tmux → run viewer inline (blocking).
+        # Remote session without tmux → run viewer inline (blocking).
         "${VIEWER_CMD[@]}"
     fi
 }

@@ -105,6 +105,12 @@ Embedded via `//go:embed`:
 - `notification-sender.sh` → `notification.go`
 - `xdg-open.sh` → `bash.go`
 
+The `xdg-open.sh` shim should apply devssh behavior only in known remote
+environments. Its remote-environment check recognizes SSH markers
+(`SSH_CONNECTION`, `SSH_TTY`, `SSH_CLIENT`) plus devcontainer markers
+(`REMOTE_CONTAINERS`, `DEVPOD`); keep `bash_test.go` coverage in sync when
+changing it.
+
 Socket file names on the remote follow the pattern
 `/tmp/devssh-<service>-<uuid>.sock`. Both the Go services and the shell
 scripts agree on this prefix.

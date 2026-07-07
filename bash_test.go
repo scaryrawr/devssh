@@ -219,3 +219,77 @@ func TestWrapBashLoginCommand(t *testing.T) {
 		})
 	}
 }
+
+func TestXdgOpenRemoteConnectionDetection(t *testing.T) {
+	function := extractShellFunction(t, xdgOpenScript, "has_remote_connection")
+	tests := []struct {
+		name   string
+		env    []string
+		remote bool
+	}{
+		{
+			name:   "ssh connection",
+			env:    []string{"SSH_CONNECTION=127.0.0.1 12345 127.0.0.1 22"},
+			remote: true,
+		},
+		{
+			name:   "ssh tty",
+			env:    []string{"SSH_TTY=/dev/pts/1"},
+			remote: true,
+		},
+		{
+			name:   "ssh client",
+			env:    []string{"SSH_CLIENT=127.0.0.1 12345 22"},
+			remote: true,
+		},
+		{
+			name:   "remote containers",
+			env:    []string{"REMOTE_CONTAINERS=true"},
+			remote: true,
+		},
+		{
+			name:   "devpod",
+			env:    []string{"DEVPOD=true"},
+			remote: true,
+		},
+		{
+			name:   "local shell",
+			remote: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command("bash", "-c", function+"\nhas_remote_connection")
+			cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, tt.env...)
+			err := cmd.Run()
+			if tt.remote && err != nil {
+				t.Fatalf("has_remote_connection returned false, want true: %v", err)
+			}
+			if !tt.remote && err == nil {
+				t.Fatal("has_remote_connection returned true, want false")
+			}
+		})
+	}
+}
+
+func extractShellFunction(t *testing.T, script, name string) string {
+	t.Helper()
+
+	start := name + "() {"
+	lines := strings.Split(script, "\n")
+	for i, line := range lines {
+		if line != start {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			if lines[j] == "}" {
+				return strings.Join(lines[i:j+1], "\n")
+			}
+		}
+		t.Fatalf("function %q has no closing brace", name)
+	}
+
+	t.Fatalf("function %q not found", name)
+	return ""
+}
