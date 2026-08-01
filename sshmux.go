@@ -27,8 +27,10 @@ type Mux struct {
 	SocketPath string
 	SSHOptions []string
 
-	stopOnce sync.Once
-	stopErr  error
+	masterCmd  *exec.Cmd
+	masterWait <-chan error
+	stopOnce   sync.Once
+	stopErr    error
 }
 
 // muxSocketPath returns a per-session, alias-derived socket path short enough
@@ -70,7 +72,6 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 	args := []string{
 		"-M",
 		"-N",
-		"-f",
 		"-S", socket,
 		"-o", "ControlMaster=yes",
 		"-o", "ControlPath=" + socket,
@@ -85,25 +86,53 @@ func StartMux(ctx context.Context, host string, extraOpts []string) (*Mux, error
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	start := time.Now()
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
 		logElapsed("ssh ControlMaster command", start)
 		return nil, fmt.Errorf("start ssh ControlMaster for %s: %w (stderr: %s)", host, err, strings.TrimSpace(stderr.String()))
 	}
 	logElapsed("ssh ControlMaster command", start)
 
-	m := &Mux{Host: host, SocketPath: socket, SSHOptions: append([]string(nil), extraOpts...)}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	m := &Mux{
+		Host:       host,
+		SocketPath: socket,
+		SSHOptions: append([]string(nil), extraOpts...),
+		masterCmd:  cmd,
+		masterWait: waitCh,
+	}
 
 	start = time.Now()
-	if err := m.Check(); err != nil {
-		logElapsed("ssh ControlMaster check", start)
-		if stopErr := m.Stop(); stopErr != nil {
-			logDebug("stop failed after ControlMaster check error: %v", stopErr)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelStartup()
+	for {
+		checkErr := m.check(startupCtx)
+		if checkErr == nil {
+			logElapsed("ssh ControlMaster check", start)
+			return m, nil
 		}
-		return nil, fmt.Errorf("ControlMaster did not become ready: %w", err)
-	}
-	logElapsed("ssh ControlMaster check", start)
 
-	return m, nil
+		select {
+		case err := <-waitCh:
+			logElapsed("ssh ControlMaster check", start)
+			if err == nil {
+				return nil, fmt.Errorf("ssh ControlMaster for %s exited before becoming ready (stderr: %s)", host, strings.TrimSpace(stderr.String()))
+			}
+			return nil, fmt.Errorf("ssh ControlMaster for %s exited before becoming ready: %w (stderr: %s)", host, err, strings.TrimSpace(stderr.String()))
+		case <-startupCtx.Done():
+			_ = cmd.Process.Kill()
+			<-waitCh
+			logElapsed("ssh ControlMaster check", start)
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("wait for ssh ControlMaster for %s: %w", host, err)
+			}
+			return nil, fmt.Errorf("ControlMaster did not become ready: %w (stderr: %s)", checkErr, strings.TrimSpace(stderr.String()))
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // muxBaseOpts returns the SSH options applied to every command run against
@@ -121,8 +150,12 @@ func (m *Mux) muxBaseOpts() []string {
 
 // Check verifies the master is reachable using `ssh -O check`.
 func (m *Mux) Check() error {
+	return m.check(context.Background())
+}
+
+func (m *Mux) check(ctx context.Context) error {
 	args := append(m.muxBaseOpts(), "-O", "check", m.Host)
-	cmd := exec.Command("ssh", args...)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -248,6 +281,19 @@ func (m *Mux) Stop() error {
 			// Don't fail loudly: master may already be gone if the
 			// interactive session exited. Surface as a soft error.
 			m.stopErr = fmt.Errorf("ssh -O exit: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+		}
+		if m.masterWait != nil {
+			select {
+			case <-m.masterWait:
+			case <-time.After(5 * time.Second):
+				if m.masterCmd != nil && m.masterCmd.Process != nil {
+					_ = m.masterCmd.Process.Kill()
+					<-m.masterWait
+				}
+				if m.stopErr == nil {
+					m.stopErr = fmt.Errorf("ssh ControlMaster did not exit after control command")
+				}
+			}
 		}
 		if err := os.Remove(m.SocketPath); err != nil && !os.IsNotExist(err) {
 			logDebug("remove mux socket %s: %v", m.SocketPath, err)
