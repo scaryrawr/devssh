@@ -22,6 +22,30 @@ log="$0.invocations"
 # Resolve the log file path relative to this script.
 log="` + logPath + `"
 printf '%s\n' "$(IFS='|'; echo "$*")" >> "$log"
+socket=""
+previous=""
+for arg in "$@"; do
+	if [ "$previous" = "-S" ]; then
+		socket="$arg"
+		break
+	fi
+	previous="$arg"
+done
+case " $* " in
+	*" -M "*)
+		touch "$socket"
+		while [ -e "$socket" ]; do sleep 0.01; done
+		exit 0
+		;;
+	*" -O check "*)
+		[ -e "$socket" ]
+		exit $?
+		;;
+	*" -O exit "*)
+		rm -f "$socket"
+		exit 0
+		;;
+esac
 ` + behavior + `
 exit 0
 `
@@ -70,9 +94,23 @@ func TestStartMux_BuildsExpectedCommand(t *testing.T) {
 		t.Fatalf("expected at least 2 ssh invocations (master + check), got %v", invocations)
 	}
 
-	master := invocations[0]
-	if !strings.Contains(master, "-M") || !strings.Contains(master, "-N") || !strings.Contains(master, "-f") {
-		t.Errorf("master invocation missing -M/-N/-f: %s", master)
+	var master, check string
+	for _, invocation := range invocations {
+		switch {
+		case strings.Contains(invocation, "-M"):
+			master = invocation
+		case strings.Contains(invocation, "-O|check"):
+			check = invocation
+		}
+	}
+	if master == "" {
+		t.Fatalf("master invocation not found: %v", invocations)
+	}
+	if !strings.Contains(master, "-M") || !strings.Contains(master, "-N") {
+		t.Errorf("master invocation missing -M/-N: %s", master)
+	}
+	if strings.Contains(master, "-f") {
+		t.Errorf("master invocation must remain owned by devssh instead of backgrounding: %s", master)
 	}
 	if !strings.Contains(master, "ControlMaster=yes") {
 		t.Errorf("master invocation missing ControlMaster=yes: %s", master)
@@ -81,9 +119,8 @@ func TestStartMux_BuildsExpectedCommand(t *testing.T) {
 		t.Errorf("master invocation should end with host alpha: %s", master)
 	}
 
-	check := invocations[1]
-	if !strings.Contains(check, "-O|check") {
-		t.Errorf("expected check invocation, got: %s", check)
+	if check == "" {
+		t.Errorf("check invocation not found: %v", invocations)
 	}
 }
 
